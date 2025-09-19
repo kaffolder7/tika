@@ -1,0 +1,111 @@
+name: Rebuild on new Apache Tika tag
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 * * * *"  # hourly; adjust as needed
+
+permissions:
+  contents: write   # to commit state file
+  packages: write   # to push to GHCR
+
+env:
+  STATE_FILE: .github/upstream-tika-tag.txt
+  PLATFORMS: linux/amd64  # add ",linux/arm64" for multi-arch
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive lowercase image name for GHCR
+        id: img
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Look up latest upstream tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Most recent tag (by push time)
+          latest="$(gh api /repos/apache/tika/tags -F per_page=1 -q '.[0].name')"
+          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+            echo "Failed to resolve latest tag" >&2
+            exit 1
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream tag: $latest"
+
+      - name: Load previously seen tag
+        id: prev
+        run: |
+          if [ -f "$STATE_FILE" ]; then
+            printf "prev=%s\n" "$(cat "$STATE_FILE")" >> "$GITHUB_OUTPUT"
+          else
+            echo "prev=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          if [ "${{ steps.latest.outputs.latest }}" != "${{ steps.prev.outputs.prev }}" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New tag detected: ${{ steps.latest.outputs.latest }}"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No change in tag; skipping build."
+          fi
+
+      - name: Log in to GHCR
+        if: steps.decide.outputs.changed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags/labels)
+        if: steps.decide.outputs.changed == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.image }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.latest.outputs.latest }}
+
+      - name: Set up QEMU
+        if: steps.decide.outputs.changed == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        if: steps.decide.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.decide.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: ${{ env.PLATFORMS }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # If you adopted the ARG-based Dockerfile above, pass the exact upstream tag:
+          build-args: |
+            TIKA_TAG=${{ steps.latest.outputs.latest }}
+          # If you kept "FROM apache/tika:latest" instead, remove build-args.
+          # You'll still publish your image tagged as both :latest and :<upstream-tag>.
+
+      - name: Save latest seen tag (commit state)
+        if: steps.decide.outputs.changed == 'true'
+        run: |
+          echo "${{ steps.latest.outputs.latest }}" > "$STATE_FILE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$STATE_FILE"
+          git commit -m "ci: track apache/tika tag ${{ steps.latest.outputs.latest }} [skip ci]"
+          git push
