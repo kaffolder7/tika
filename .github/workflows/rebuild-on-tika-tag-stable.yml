@@ -26,20 +26,46 @@ jobs:
 
       # ✅ Get the latest "stable" tag — digits and dots only (e.g., 3.2.3)
       #    This skips pre-releases like 3.0.0-BETA2, 4.0.0-rc.1, etc.
-      - name: Look up latest stable upstream tag
+      - name: Look up latest stable upstream tag (skip pre-releases)
         id: latest
         env:
+          API: https://api.github.com/repos/apache/tika/tags?per_page=100
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          stable_tag="$(gh api repos/apache/tika/tags -F per_page=100 \
-            --jq '[.[] | select(.name | test("^[0-9]+(\\.[0-9]+){1,3}$"))][0].name')"
-          if [ -z "${stable_tag:-}" ] || [ "${stable_tag}" = "null" ]; then
-            echo "Could not find a stable tag" >&2
+
+          # Try GitHub REST API first
+          if resp="$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$API")"; then
+            :
+          else
+            echo "GitHub API call failed; falling back to git ls-remote..." >&2
+            resp=""
+          fi
+
+          if [ -n "$resp" ]; then
+            # names only, skip pre-releases (digits and dots only), pick highest semver
+            latest="$(printf '%s\n' "$resp" | jq -r '.[].name' \
+              | grep -E '^[0-9]+(\.[0-9]+){1,3}$' \
+              | sort -V | tail -n1)"
+          else
+            # Fallback: query tags via git
+            latest="$(git ls-remote --tags https://github.com/apache/tika.git \
+              | awk '{print $2}' | sed 's@refs/tags/@@' \
+              | grep -E '^[0-9]+(\.[0-9]+){1,3}$' \
+              | sort -V | tail -n1)"
+          fi
+
+          if [ -z "${latest:-}" ]; then
+            echo "Could not determine latest stable tag" >&2
             exit 1
           fi
-          echo "latest=${stable_tag}" >> "$GITHUB_OUTPUT"
-          echo "Latest stable upstream tag: ${stable_tag}"
+
+          echo "Latest stable upstream tag: $latest"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
 
       - name: Load previously seen tag
         id: prev
